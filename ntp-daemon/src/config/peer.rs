@@ -21,16 +21,12 @@ impl Default for PeerHostMode {
 
 #[derive(Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct StandardPeerConfig {
-    // We ensure that this is an address with a host and port part
-    // however the host may or may not be valid.
-    pub addr: String,
+    pub addr: NormalizedAddress,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq, Clone)]
 pub struct PoolPeerConfig {
-    // We ensure that this is an address with a host and port part
-    // however the host may or may not be valid.
-    pub addr: String,
+    pub addr: NormalizedAddress,
     pub max_peers: usize,
 }
 
@@ -41,34 +37,65 @@ pub enum PeerConfig {
     // Consul(ConsulPeerConfig),
 }
 
-fn normalize_addr(mut addr: String) -> std::io::Result<String> {
-    if addr.split(':').count() > 2 {
-        // IPv6, try to parse it as such
-        match addr.parse::<SocketAddr>() {
-            Ok(_) => Ok(addr),
-            Err(e) => {
-                // Could be because of no port, add one and see
-                addr = format!("[{addr}]:123");
-                if addr.parse::<SocketAddr>().is_ok() {
-                    Ok(addr)
-                } else {
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+impl PeerConfig {
+    pub(crate) fn try_from_str(value: &str) -> Result<Self, std::io::Error> {
+        Self::try_from(value)
+    }
+}
+
+/// A normalized address has a host and a port part. However, the host may be
+/// invalid, we didn't yet perform a DNS lookup.
+#[derive(Deserialize, Debug, PartialEq, Eq, Clone)]
+pub struct NormalizedAddress {
+    address: String,
+}
+
+impl NormalizedAddress {
+    /// Specifically, this adds the `:123` port if no port is specified
+    fn from_string(mut address: String) -> std::io::Result<Self> {
+        if address.split(':').count() > 2 {
+            // IPv6, try to parse it as such
+            match address.parse::<SocketAddr>() {
+                Ok(_) => Ok(Self { address }),
+                Err(e) => {
+                    // Could be because of no port, add one and see
+                    address = format!("[{address}]:123");
+                    if address.parse::<SocketAddr>().is_ok() {
+                        Ok(Self { address })
+                    } else {
+                        Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    }
                 }
             }
+        } else if let Some((_, port)) = address.split_once(':') {
+            // Not ipv6, and we seem to have a port. We cant reasonably
+            // check whether the host is valid, but at least check that
+            // the port is.
+            match port.parse::<u16>() {
+                Ok(_) => Ok(Self { address }),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+            }
+        } else {
+            // Not ipv6 and no port. As we cant reasonably check host
+            // so just append a port
+            address.push_str(":123");
+            Ok(Self { address })
         }
-    } else if let Some((_, port)) = addr.split_once(':') {
-        // Not ipv6, and we seem to have a port. We cant reasonably
-        // check whether the host is valid, but at least check that
-        // the port is.
-        match port.parse::<u16>() {
-            Ok(_) => Ok(addr),
-            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.address
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(value: &str) -> Self {
+        Self {
+            address: value.to_string(),
         }
-    } else {
-        // Not ipv6 and no port. As we cant reasonably check host
-        // so just append a port
-        addr.push_str(":123");
-        Ok(addr)
+    }
+
+    pub async fn lookup_host(&self) -> std::io::Result<impl Iterator<Item = SocketAddr> + '_> {
+        tokio::net::lookup_host(&self.address).await
     }
 }
 
@@ -77,15 +104,15 @@ impl TryFrom<&str> for StandardPeerConfig {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         Ok(Self {
-            addr: normalize_addr(value.into())?,
+            addr: NormalizedAddress::from_string(value.to_string())?,
         })
     }
 }
 
-impl TryFrom<&str> for PeerConfig {
+impl<'a> TryFrom<&'a str> for PeerConfig {
     type Error = std::io::Error;
 
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn try_from(value: &'a str) -> Result<Self, Self::Error> {
         StandardPeerConfig::try_from(value).map(Self::Standard)
     }
 }
@@ -122,9 +149,9 @@ impl<'de> Deserialize<'de> for PeerConfig {
                             }
                             let raw: String = map.next_value()?;
 
-                            // validate: this will add the `:123` port if no port is specified
                             let parsed_addr =
-                                normalize_addr(raw.as_str().into()).map_err(de::Error::custom)?;
+                                NormalizedAddress::from_string(raw.as_str().to_string())
+                                    .map_err(de::Error::custom)?;
 
                             addr = Some(parsed_addr);
                         }
@@ -179,8 +206,8 @@ mod tests {
 
     fn peer_addr(config: &PeerConfig) -> &str {
         match config {
-            PeerConfig::Standard(c) => &c.addr,
-            PeerConfig::Pool(c) => &c.addr,
+            PeerConfig::Standard(c) => c.addr.as_str(),
+            PeerConfig::Pool(c) => c.addr.as_str(),
         }
     }
 
@@ -228,7 +255,7 @@ mod tests {
         .unwrap();
         assert!(matches!(test.peer, PeerConfig::Pool(_)));
         if let PeerConfig::Pool(config) = test.peer {
-            assert_eq!(config.addr, "example.com:123");
+            assert_eq!(config.addr.as_str(), "example.com:123");
             assert_eq!(config.max_peers, 1);
         }
 
@@ -243,7 +270,7 @@ mod tests {
         .unwrap();
         assert!(matches!(test.peer, PeerConfig::Pool(_)));
         if let PeerConfig::Pool(config) = test.peer {
-            assert_eq!(config.addr, "example.com:123");
+            assert_eq!(config.addr.as_str(), "example.com:123");
             assert_eq!(config.max_peers, 42);
         }
     }
@@ -261,16 +288,16 @@ mod tests {
 
     #[test]
     fn test_normalize_addr() {
-        let addr = normalize_addr("[::1]:456".into()).unwrap();
-        assert_eq!(addr, "[::1]:456");
-        let addr = normalize_addr("::1".into()).unwrap();
-        assert_eq!(addr, "[::1]:123");
-        assert!(normalize_addr(":some:invalid:1".into()).is_err());
-        let addr = normalize_addr("127.0.0.1:456".into()).unwrap();
-        assert_eq!(addr, "127.0.0.1:456");
-        let addr = normalize_addr("127.0.0.1".into()).unwrap();
-        assert_eq!(addr, "127.0.0.1:123");
-        let addr = normalize_addr("1234567890.example.com".into()).unwrap();
-        assert_eq!(addr, "1234567890.example.com:123");
+        let addr = NormalizedAddress::from_string("[::1]:456".into()).unwrap();
+        assert_eq!(addr.as_str(), "[::1]:456");
+        let addr = NormalizedAddress::from_string("::1".into()).unwrap();
+        assert_eq!(addr.as_str(), "[::1]:123");
+        assert!(NormalizedAddress::from_string(":some:invalid:1".into()).is_err());
+        let addr = NormalizedAddress::from_string("127.0.0.1:456".into()).unwrap();
+        assert_eq!(addr.as_str(), "127.0.0.1:456");
+        let addr = NormalizedAddress::from_string("127.0.0.1".into()).unwrap();
+        assert_eq!(addr.as_str(), "127.0.0.1:123");
+        let addr = NormalizedAddress::from_string("1234567890.example.com".into()).unwrap();
+        assert_eq!(addr.as_str(), "1234567890.example.com:123");
     }
 }
