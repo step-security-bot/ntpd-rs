@@ -296,6 +296,7 @@ mod raw_socket {
             rx_reserved: [u32; 3],
         }
 
+        /// source: https://github.com/torvalds/linux/blob/master/include/uapi/linux/if.h#L241
         #[repr(C)]
         union ifr_ifru {
             ifr_addr: libc::sockaddr,
@@ -313,6 +314,7 @@ mod raw_socket {
             ifr_data: *mut libc::c_char,
         }
 
+        /// source: https://github.com/torvalds/linux/blob/master/include/uapi/linux/if.h#L196
         #[repr(C)]
         #[allow(non_camel_case_types)]
         #[derive(Clone, Copy)]
@@ -325,6 +327,7 @@ mod raw_socket {
             port: libc::c_uchar,
         }
 
+        /// source: https://github.com/torvalds/linux/blob/master/include/uapi/linux/if.h#L234
         #[repr(C)]
         #[allow(non_camel_case_types)]
         struct ifreq {
